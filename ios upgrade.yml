@@ -1,0 +1,253 @@
+---
+# Ansible Playbook to upgrade Cisco IOS 
+
+## Create backup folder for today 
+
+- hosts: localhost
+
+  tasks:
+    - name: Get ansible date/time facts
+      setup:
+        filter: "ansible_date_time"
+        gather_subset: "!all"
+
+    - name: Store date as fact for folder name
+      set_fact:
+        Date_Folder: "{{ ansible_date_time.date }}"
+
+    - name: Create Directory {{hostvars.localhost.Date_Folder}}
+      file:
+       path: ~/ConfigBackups/{{hostvars.localhost.Date_Folder}}
+       state: directory
+  run_once: true
+  
+
+ ## Collect pre-change log 
+
+- hosts: switch 
+  connection: network_cli
+  become: yes
+  become_method: enable
+  
+  
+  vars:
+    
+    - new_ios_file: 
+    - new_ios_version:
+    - IS_REBOOT_REQUIRED: 
+  
+  
+  tasks:
+ 
+ 
+## Collecting pre-config logs
+
+    - name: Collect pre-logs
+      ios_facts:
+      register: switch_facts
+ 
+    - name: Pre-change log  
+      ios_command:
+        commands: 
+           - show version
+           - show interfaces
+           - show module
+           - show vlan
+           - show cdp neighbors
+
+      register: pre_config_log
+
+    - name: Save output to backup folder
+      copy:
+        content: "{{pre_config_log.stdout[0]}}"
+        dest: "~/ConfigBackups/{{hostvars.localhost.Date_Folder}}/{{ inventory_hostname }}-{{hostvars.localhost.Date_Folder}}-pre_config_log.txt"
+
+## Backup Running Config 
+
+    - name: Backup Running Config  
+      ios_command:
+        commands: show run  
+      register: config
+
+    - name: Save output to backup folder
+      copy:
+        content: "{{config.stdout[0]}}"
+        dest: "~/ConfigBackups/{{hostvars.localhost.Date_Folder}}/{{ inventory_hostname }}-{{hostvars.localhost.Date_Folder}}-config.txt"
+
+
+## Deleting unused .bin image files
+
+    - name: Check current .bin files in Flash
+      ios_command:
+        commands: "show bootflash: | inc .bin"
+      register: bin
+
+    - name: Set Variables
+      set_fact:
+        bin1: "{{ bin.stdout_lines[0][0] }}"
+        bin2: "{{ bin.stdout_lines[0][1] }}"
+
+#Deleting unused .bin image files in bootflash
+
+    - name: Create variable for memory space
+      set_fact:
+          MemFreeB: switch_facts.ansible_facts["ansible_net_filesystems_info"]["bootflash:"]["spacefree_kb"]
+
+    - name: Clean Up .bin images not in use
+      block:
+        - name: Clean Up unused Image number 1 [Skip if image in use]
+          ios_command:
+            commands:
+              - command: "delete bootflash:{{ {{ item }}.split()[-1]}}\n\n"
+
+        - debug:
+            msg: "Deleted .bin image = {{ {{ item }}.split()[-1] }}"
+
+      when:
+        - {{ item }}.split()[-1] not in switch_facts.ansible_facts.ansible_net_image  and  MemFreeB > size 
+
+      loop:
+        - bin1
+        - bin2
+        
+#Deleting unused .bin image files in slavebootflash		
+
+
+    - name: Create variable for memory space
+      set_fact:
+          MemFreeSB: switch_facts.ansible_facts["ansible_net_filesystems_info"]["slavebootflash:"]["spacefree_kb"]
+ 
+    - name: Clean Up .bin images not in use
+      block:
+        - name: Clean Up unused Image number 1 [Skip if image in use]
+          ios_command:
+            commands:
+              - command: "delete bootflash:{{ {{ item }}.split()[-1]}}\n\n"
+
+        - debug:
+            msg: "Deleted .bin image = {{ {{ item }}.split()[-1] }}"
+
+      when:
+        - {{ item }}.split()[-1] not in switch_facts.ansible_facts.ansible_net_image and MemFreeSB > size 
+
+      loop:
+        - bin1
+        - bin2
+
+## check if New IOS file present in bootflash or not. If file not present upload it	   
+
+    - name: Is file present in bootflash
+      ios_command:
+        commands: "show bootflash: | inc {{ new_ios_file }}"
+      register: bootflash_file_present
+ 
+    - name: Load IOS
+      ios_command:
+        commands:
+          - command: "copy tftp://user:some_pass@{{ server_ip }}/{{ new_ios_file }} bootflash:"
+            prompt: "]?"
+            answer: "\r"
+      vars:
+        ansible_command_timeout: 600
+      when: bootflash_file_present.stdout[0] == ""
+
+## Check if New IOS file present in slavebootflash or not. If file not present upload it
+
+
+    - name: Is file present in slavebootflash
+      ios_command:
+        commands: "show slavebootflash: | inc {{ new_ios_file }}"
+      register: slavebootflash_file_present
+ 
+    - name: Load IOS
+      ios_command:
+        commands:
+          - command: "copy tftp://user:some_pass@{{ server_ip }}/{{ new_ios_file }} slavebootflash:"
+            prompt: "]?"
+            answer: "\r"
+      vars:
+        ansible_command_timeout: 600
+      when: slavebootflash_file_present.stdout[0] == ""
+
+
+## Check MD5 HASH
+
+    - name: Check MD5 HASH
+      ios_command:
+         commands:
+            - command: "verify /md5 bootflash:{{ new_ios_file}}"
+      register: md5_result
+      vars:
+         ansible_command_timeout: 300
+
+## Continue upgrade if MD5 HASH matches
+
+    - name: Continue upgrade if MD5 HASH matches
+      block:
+      - name: Setting boot image
+        ios_config:
+          lines:
+          - no boot system
+          - boot system flash bootflash:{{ new_ios_file}}
+
+          match: none
+          save_when: always
+
+      - name: Reboot switch if required
+        block:
+        - name: Rebooting the switch.....
+          ios_command:
+             commands:
+                - command: "reload"
+                  prompt: '[confirm]'
+                  answer: "\r"
+          vars:
+            ansible_command_timeout: 30
+
+        - name: Wait for 10 mins... switch is reloading 
+          wait_for:
+            host: "{{inventory_hostname}}"
+            port: 22
+            delay: 60
+            timeout: 600
+          delegate_to: localhost
+
+        when: IS_REBOOT_REQUIRED == "YES"
+
+      when: '"new_ios_md5" in md5_result.stdout[0]'	  
+
+
+## Collect post-change logs
+
+    - name: Post-change log 
+      ios_command:
+        commands: 
+          - show version
+          - show interfaces
+          - show module
+          - show vlan
+          - show cdp neighbors
+
+      register: pre_config_log
+
+    - name: ConfigBackups
+      copy:
+        content: "{{pre_config_log.stdout[0]}}"
+        dest: "~/ConfigBackups/{{hostvars.localhost.Date_Folder}}/{{ inventory_hostname }}-{{hostvars.localhost.Date_Folder}}-post_config_log.txt"
+
+
+## Check the current version after upgrade	  
+
+    - name: Validate version
+      ios_facts:
+
+    - debug: 
+        msg: 
+        - "Current version is {{ ansible_net_version }}"
+        - "Upgrade image is {{new_ios_version}}"
+
+    - debug: 
+        msg: 
+        - "Device has succesfully upgraded, it has latest version now"
+
+      when: ansible_net_version == new_ios_version   
